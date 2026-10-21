@@ -1,0 +1,41 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Python Virtual Environments & Cache
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Node / Frontend / Hardhat
+node_modules/
+blockchain/artifacts/
+blockchain/cache/
+frontend/dist/
+frontend/build/
+
+# Datasets, Artifacts & Checkpoints
+datasets/
+artifacts/
+test/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs & Generated Outputs
+logs/
+*.log
+tmp/

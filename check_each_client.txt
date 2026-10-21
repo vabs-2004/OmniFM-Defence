@@ -1,0 +1,27 @@
+@'
+import json
+import sqlite3
+
+db = sqlite3.connect("omnifm.db")
+db.row_factory = sqlite3.Row
+
+try:
+    rows = db.execute("""
+        SELECT experiment_id, round_num, client_id, num_samples,
+               eval_metrics_json
+        FROM client_updates
+        WHERE experiment_id = ?
+          AND round_num = 80
+        ORDER BY client_id
+    """, ("omnifm_classification_r80_s42",)).fetchall()
+
+    if not rows:
+        print("No matching client updates found.")
+
+    for row in rows:
+        print(f"\nClient: {row['client_id']}")
+        print(f"Samples: {row['num_samples']}")
+        print(f"Metrics: {row['eval_metrics_json']}")
+finally:
+    db.close()
+'@ | .\venv\Scripts\python.exe -
