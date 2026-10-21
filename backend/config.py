@@ -64,6 +64,8 @@ class Settings(BaseModel):
     default_local_epochs: int = Field(default=1)
     random_seed: int = Field(default=42)
     precision_policy: PrecisionPolicy = Field(default="fp16_amp")
+    fl_client_auth_token: SecretStr = Field(default=SecretStr(""))
+    distributed_round_timeout_sec: int = Field(default=300)
 
     # Task batch sizes
     batch_size_classification: int = Field(default=32)
@@ -193,12 +195,24 @@ class Settings(BaseModel):
             raise ValueError(f"Invalid MAX_KNOWLEDGE_BANK_SIZE '{v}': must be >= 1.")
         return v
 
-    @field_validator("num_clients", "default_num_rounds", "smoke_num_rounds", "default_local_epochs")
+    @field_validator(
+        "num_clients",
+        "default_num_rounds",
+        "smoke_num_rounds",
+        "default_local_epochs",
+        "distributed_round_timeout_sec",
+    )
     @classmethod
     def validate_positive_fl_counts(cls, v: int, info: Any) -> int:
         if v < 1:
             raise ValueError(f"Invalid {info.field_name.upper()} '{v}': must be >= 1.")
         return v
+
+    @field_validator("fl_client_auth_token", mode="before")
+    @classmethod
+    def coerce_auth_token(cls, v: Any) -> SecretStr:
+        raw = v.get_secret_value() if isinstance(v, SecretStr) else str(v or "").strip()
+        return SecretStr(raw)
 
     @field_validator(
         "batch_size_classification",
@@ -250,6 +264,7 @@ class Settings(BaseModel):
             "client1_private_key",
             "client2_private_key",
             "client3_private_key",
+            "fl_client_auth_token",
         ):
             secret_val: SecretStr = getattr(self, key)
             data[key] = "***REDACTED***" if secret_val.get_secret_value() else ""

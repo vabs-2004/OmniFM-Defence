@@ -441,6 +441,27 @@ class Web3Connector:
             sender_address=client_wallet_address,
         )
 
+    def set_experiment_expected_clients(
+        self,
+        experiment_id: str,
+        expected_count: int,
+        server_private_key: str | SecretStr | None = None,
+    ) -> TxReceiptRecord:
+        """Configure the expected client quorum for `experiment_id` on-chain (owner-only)."""
+        key = _unwrap_secret(server_private_key or self.cfg.server_private_key)
+        if not key:
+            raise BlockchainTransactionError(
+                "Missing SERVER_PRIVATE_KEY required for owner-only 'set_experiment_expected_clients'."
+            )
+        fn = self.contract.get_function_by_signature(
+            "setExperimentExpectedClients(string,uint256)"
+        )(experiment_id, int(expected_count))
+        return self._send_transaction(
+            tx_call=fn,
+            private_key=key,
+            action="set_experiment_expected_clients",
+        )
+
     def check_all_submitted(self, experiment_id: str, round_num: int) -> bool:
         """Return True if all expected hospitals have submitted for `(experiment_id, round_num)`."""
         fn = self.contract.get_function_by_signature("checkAllSubmitted(string,uint256)")

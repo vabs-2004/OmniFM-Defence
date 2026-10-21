@@ -10,8 +10,10 @@ from pathlib import Path
 import torch
 
 from backend.utils.hashing import (
+    deserialize_state_dict_canonical,
     hash_file,
     hash_state_dict,
+    serialize_state_dict_canonical,
     verify_file_hash,
     verify_state_dict_hash,
 )
@@ -65,6 +67,41 @@ class TestDeterministicHashing(unittest.TestCase):
             digest = hash_file(ckpt_path)
             self.assertTrue(verify_file_hash(ckpt_path, digest))
             self.assertFalse(verify_file_hash(ckpt_path, "0x" + "1" * 64))
+
+    def test_canonical_serialization_and_deserialization_roundtrip_and_guards(self) -> None:
+        orig_state = {
+            "conv.weight": torch.randn(4, 3, 3, 3, dtype=torch.float32),
+            "fp16.bias": torch.tensor([0.25, -0.75, 1.5], dtype=torch.float16),
+            "bf16.scale": torch.tensor([2.0, -4.0], dtype=torch.bfloat16),
+            "bn.num_batches_tracked": torch.tensor(12, dtype=torch.int64),
+        }
+        expected_hash = hash_state_dict(orig_state)
+        raw_bytes = serialize_state_dict_canonical(orig_state)
+
+        restored = deserialize_state_dict_canonical(raw_bytes)
+        self.assertEqual(set(restored.keys()), set(orig_state.keys()))
+        self.assertEqual(hash_state_dict(restored), expected_hash)
+        for k, t in orig_state.items():
+            self.assertEqual(restored[k].dtype, t.dtype)
+            self.assertEqual(tuple(restored[k].shape), tuple(t.shape))
+            self.assertEqual(restored[k].device.type, "cpu")
+            self.assertTrue(torch.equal(restored[k], t.cpu()))
+
+        # Invalid magic header rejected
+        with self.assertRaises(ValueError):
+            deserialize_state_dict_canonical(b"BAD_HEADER_V1\x00\x00\x00" + raw_bytes[16:])
+
+        # Truncated payload rejected
+        with self.assertRaises(ValueError):
+            deserialize_state_dict_canonical(raw_bytes[:-5])
+
+        # Trailing garbage rejected
+        with self.assertRaises(ValueError):
+            deserialize_state_dict_canonical(raw_bytes + b"\x00")
+
+        # Max byte limit enforced
+        with self.assertRaises(ValueError):
+            deserialize_state_dict_canonical(raw_bytes, max_bytes=32)
 
 
 if __name__ == "__main__":

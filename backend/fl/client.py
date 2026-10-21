@@ -118,6 +118,7 @@ class FederatedHospitalClient:
                     else:
                         self._personalized_state[k] = src.to(device="cpu").clone()
         ckpt_file = self.local_checkpoint_dir / f"{experiment_id}_r{round_num}_personalized.pt"
+        ckpt_file.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self._personalized_state, ckpt_file)
 
     @staticmethod

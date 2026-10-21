@@ -22,7 +22,6 @@ frontend/build/
 datasets/
 artifacts/
 test/
-tests/
 *.pt
 *.pth
 *.ckpt

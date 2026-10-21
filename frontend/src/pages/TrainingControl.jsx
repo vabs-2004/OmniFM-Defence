@@ -14,6 +14,7 @@ import { extractApiError, omnifmApi } from "../services/api";
 export default function TrainingControl() {
   const [taskType, setTaskType] = useState("classification");
   const [algorithm, setAlgorithm] = useState("omnifm");
+  const [executionMode, setExecutionMode] = useState("single_laptop");
   const [numRounds, setNumRounds] = useState(5);
   const [localEpochs, setLocalEpochs] = useState(1);
   const [batchSize, setBatchSize] = useState(4);
@@ -65,6 +66,13 @@ export default function TrainingControl() {
     setSubmitting(true);
     setError("");
     try {
+      const modeConfig =
+        executionMode === "distributed_two_laptop"
+          ? {
+              client_ids: ["client_1", "client_2"],
+              remote_client_ids: ["client_2"],
+            }
+          : {};
       const res = await omnifmApi.startTraining({
         task_type: taskType,
         num_rounds: Number(numRounds),
@@ -75,6 +83,7 @@ export default function TrainingControl() {
           batch_size: Number(batchSize),
           max_samples: Number(maxSamples),
           scale_factor: Number(scaleFactor),
+          ...modeConfig,
           ...ablations,
         },
       });
@@ -121,7 +130,7 @@ export default function TrainingControl() {
           Federated Training Orchestration & Control
         </h1>
         <p className="text-sm text-slate-400 mt-1">
-          Configure sequential 3-hospital federated training on the single 6 GB GPU, monitor live rounds, or cancel/resume from verified SHA-256 checkpoints.
+          Configure sequential 3-hospital single-laptop training (default failsafe) or 2-laptop distributed federation (Laptop A GPU + Laptop B remote CPU), monitor live rounds, or cancel/resume from verified SHA-256 checkpoints.
         </p>
       </div>
 
@@ -139,6 +148,38 @@ export default function TrainingControl() {
           <h2 className="text-base font-semibold text-white">
             Job Configuration
           </h2>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">
+              Execution Mode
+            </label>
+            <select
+              value={executionMode}
+              onChange={(e) => setExecutionMode(e.target.value)}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white"
+            >
+              <option value="single_laptop">
+                Mode A: Single-Laptop Failsafe (Default — 3 Local Hospitals)
+              </option>
+              <option value="distributed_two_laptop">
+                Mode B: Two-Laptop Distributed (Laptop A GPU + Laptop B Remote CPU)
+              </option>
+            </select>
+          </div>
+
+          {executionMode === "distributed_two_laptop" && (
+            <div className="bg-indigo-950/50 border border-indigo-800/70 rounded-lg p-3 text-xs text-indigo-200 space-y-1">
+              <div className="font-semibold">
+                Two-Laptop Distributed Setup (client_1 GPU + client_2 Remote CPU)
+              </div>
+              <div className="text-indigo-300">
+                Ensure <code className="text-white">FL_CLIENT_AUTH_TOKEN</code> is set on both machines, then run on Laptop B:
+              </div>
+              <div className="bg-slate-950 border border-slate-800 rounded p-2 font-mono text-[11px] text-emerald-300 break-all">
+                python -m backend.fl.remote_client --coordinator-url http://&lt;LAPTOP_A_IP&gt;:8000 --client-id client_2 --device cpu
+              </div>
+            </div>
+          )}
 
           <div>
             <label className="block text-xs text-slate-400 mb-1">Task Type</label>
@@ -285,13 +326,25 @@ export default function TrainingControl() {
                   Current Job Lifecycle & Checkpoint Status
                 </h2>
                 <div className="text-xs text-slate-400 font-mono mt-0.5">
-                  ID: {statusData?.training_id || "None"} • Status:{" "}
+                  ID: {statusData?.training_id || "None"} • Mode:{" "}
+                  <span className="text-emerald-300 font-semibold">
+                    {statusData?.execution_mode === "distributed"
+                      ? "DISTRIBUTED (2-LAPTOP)"
+                      : "SINGLE-LAPTOP"}
+                  </span>{" "}
+                  • Status:{" "}
                   <span className="text-indigo-300 font-semibold">
                     {statusData?.status || "IDLE"}
                   </span>{" "}
                   • Round {statusData?.current_round ?? 0}/
                   {statusData?.total_rounds ?? 0}
                 </div>
+                {statusData?.awaiting_remote_clients?.length > 0 && (
+                  <div className="text-xs text-amber-300 font-mono mt-1">
+                    Waiting for remote hospital worker(s):{" "}
+                    {statusData.awaiting_remote_clients.join(", ")}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center gap-2">

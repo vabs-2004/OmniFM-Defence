@@ -14,8 +14,11 @@ Coordinates:
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -39,7 +42,7 @@ from backend.database.models import (
     MetricRecord,
     TrainingRound,
 )
-from backend.fl.aggregation import filter_shared_state_dict
+from backend.fl.aggregation import AggregationValidationError, filter_shared_state_dict
 from backend.fl.client import FederatedHospitalClient
 from backend.fl.protocols import (
     AlgorithmType,
@@ -52,7 +55,11 @@ from backend.fl.protocols import (
 from backend.fl.round_manager import RoundManager, RoundStateTransitionError
 from backend.omnifm.gskr import SpectralKnowledgeBank
 from backend.tasks import BaseTaskAdapter, create_task_adapter
-from backend.utils.hashing import hash_state_dict
+from backend.utils.hashing import (
+    hash_state_dict,
+    normalize_bytes32_hex,
+    serialize_state_dict_canonical,
+)
 from backend.utils.logging import save_run_metadata, set_global_seed, setup_logger
 
 logger = setup_logger("omnifm.fl.server")
@@ -67,6 +74,8 @@ class FederatedLearningServer:
         task_type: str,
         algorithm: AlgorithmType = "omnifm",
         client_ids: Sequence[str] = ("client_1", "client_2", "client_3"),
+        remote_client_ids: Sequence[str] = (),
+        remote_round_timeout_sec: float | None = None,
         cfg: Settings | None = None,
         database_url: str | None = None,
         web3_connector: Web3Connector | None = None,
@@ -80,6 +89,17 @@ class FederatedLearningServer:
         self.task_type = task_type.lower().strip()
         self.algorithm: AlgorithmType = algorithm
         self.client_ids = tuple(client_ids)
+        self.remote_client_ids = tuple(remote_client_ids)
+        for rcid in self.remote_client_ids:
+            if rcid not in self.client_ids:
+                raise ValueError(
+                    f"remote_client_id '{rcid}' must also be included in client_ids={self.client_ids}."
+                )
+        self.remote_round_timeout_sec = float(
+            remote_round_timeout_sec
+            if remote_round_timeout_sec is not None
+            else self.cfg.distributed_round_timeout_sec
+        )
         self.database_url = database_url or self.cfg.database_url
         self.web3_connector = web3_connector
         self.audit_required = bool(audit_required or self.cfg.blockchain_audit_enabled)
@@ -112,6 +132,18 @@ class FederatedLearningServer:
         )
         self.round_0_hash: str = ""
         self.completed_rounds: dict[int, RoundExecutionResult] = {}
+
+        # Remote round synchronization state (used only when self.remote_client_ids is non-empty)
+        self._remote_cond = threading.Condition()
+        self._active_round_mgr: RoundManager | None = None
+        self._active_round_num: int | None = None
+        self._active_round_config: dict[str, Any] = {}
+        self._active_shared_b64: str | None = None
+        self._active_shared_hash: str | None = None
+        self._active_bank_b64: str | None = None
+        self._active_bank_metadata: list[dict[str, Any]] = []
+        self._active_round_peak_vram: float = 0.0
+        self._terminal_state: str | None = None
 
         # Instantiate sequential logical hospital clients
         self.clients: dict[str, FederatedHospitalClient] = {
@@ -173,6 +205,7 @@ class FederatedLearningServer:
                 "task_type": self.task_type,
                 "algorithm": self.algorithm,
                 "client_ids": list(self.client_ids),
+                "remote_client_ids": list(self.remote_client_ids),
                 "policy": self.policy.to_manifest_dict(),
             },
         )
@@ -189,6 +222,7 @@ class FederatedLearningServer:
                 "task_type": self.task_type,
                 "algorithm": self.algorithm,
                 "client_ids": list(self.client_ids),
+                "remote_client_ids": list(self.remote_client_ids),
                 "total_rounds": total_rounds,
                 "seed": self.seed,
                 "adapter_kwargs": self.adapter_kwargs,
@@ -236,6 +270,15 @@ class FederatedLearningServer:
                                 wallet_address=str(reg_sender) if reg_sender else None,
                                 database_url=self.database_url,
                             )
+
+                if (
+                    len(self.client_ids) != 3
+                    and hasattr(self.web3_connector, "set_experiment_expected_clients")
+                ):
+                    self.web3_connector.set_experiment_expected_clients(
+                        experiment_id=self.experiment_id,
+                        expected_count=len(self.client_ids),
+                    )
 
                 already_r0 = False
                 if isinstance(self.web3_connector, Web3Connector):
@@ -307,6 +350,239 @@ class FederatedLearningServer:
         )
         return self.round_0_hash
 
+    def _record_and_accept_client_update(
+        self,
+        round_mgr: RoundManager,
+        round_num: int,
+        upd: ClientUpdatePayload,
+    ) -> None:
+        """Validate, record off-chain artifact + on-chain audit tx, and persist a client update."""
+        # 1. Validate update against RoundManager & ParameterSharingPolicy first
+        round_mgr.accept_client_update(upd)
+
+        # 2. Save client shared update artifact metadata off-chain
+        cid = upd.client_id
+        client_upd_path = (
+            self.exp_artifact_dir / "clients" / cid / f"shared_update_r{round_num}.pt"
+        )
+        if round_num <= 1:
+            client_upd_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(upd.shared_state_dict, client_upd_path)
+        record_artifact_metadata(
+            artifact_id=f"{self.experiment_id}_r{round_num}_{cid}_update",
+            experiment_id=self.experiment_id,
+            task_type=self.task_type,
+            round_num=round_num,
+            client_id=cid,
+            artifact_type="client_update",
+            file_path=str(client_upd_path),
+            sha256_hash=upd.update_hash,
+            database_url=self.database_url,
+        )
+
+        # 3. Submit client update hash to blockchain if connector configured
+        if self.web3_connector is not None:
+            try:
+                if hasattr(self.web3_connector, "ensure_hospital_registered"):
+                    reg_rec = self.web3_connector.ensure_hospital_registered(
+                        client_id=cid,
+                        hospital_name=f"Hospital_{cid}",
+                        modality=self.task_type,
+                    )
+                    reg_tx_hash = (
+                        reg_rec.get("tx_hash")
+                        if isinstance(reg_rec, dict)
+                        else getattr(reg_rec, "tx_hash", None)
+                    )
+                    reg_block = (
+                        reg_rec.get("block_number")
+                        if isinstance(reg_rec, dict)
+                        else getattr(reg_rec, "block_number", None)
+                    )
+                    reg_sender = (
+                        reg_rec.get("sender") or reg_rec.get("wallet")
+                        if isinstance(reg_rec, dict)
+                        else getattr(reg_rec, "sender", None)
+                    )
+                    if isinstance(reg_tx_hash, str) and reg_tx_hash:
+                        record_blockchain_tx(
+                            action_type="HospitalRegistered",
+                            status="CONFIRMED",
+                            experiment_id=self.experiment_id,
+                            task_type=self.task_type,
+                            round_num=round_num,
+                            client_id=cid,
+                            tx_hash=reg_tx_hash,
+                            block_number=int(reg_block) if reg_block is not None else None,
+                            wallet_address=str(reg_sender) if reg_sender else None,
+                            database_url=self.database_url,
+                        )
+                already_submitted = False
+                if isinstance(self.web3_connector, Web3Connector):
+                    sub_state = self.web3_connector.get_client_submission(
+                        self.experiment_id, round_num, cid
+                    )
+                    already_submitted = bool(sub_state.get("exists"))
+
+                if already_submitted:
+                    upd.blockchain_status = "CONFIRMED"
+                else:
+                    tx_rec = self.web3_connector.submit_model_update(
+                        experiment_id=self.experiment_id,
+                        round_num=round_num,
+                        task_type=self.task_type,
+                        model_hash=upd.update_hash,
+                        client_id=cid,
+                    )
+                    upd.blockchain_tx_hash = tx_rec.tx_hash
+                    upd.blockchain_status = "CONFIRMED"
+                    record_blockchain_tx(
+                        action_type="ModelUpdateSubmitted",
+                        status="CONFIRMED",
+                        experiment_id=self.experiment_id,
+                        task_type=self.task_type,
+                        round_num=round_num,
+                        client_id=cid,
+                        artifact_hash=upd.update_hash,
+                        tx_hash=tx_rec.tx_hash,
+                        block_number=tx_rec.block_number,
+                        wallet_address=tx_rec.sender,
+                        database_url=self.database_url,
+                    )
+            except BlockchainError as exc:
+                upd.blockchain_status = "FAILED"
+                record_blockchain_tx(
+                    action_type="ModelUpdateSubmitted",
+                    status="FAILED",
+                    experiment_id=self.experiment_id,
+                    task_type=self.task_type,
+                    round_num=round_num,
+                    client_id=cid,
+                    artifact_hash=upd.update_hash,
+                    error_message=str(exc),
+                    database_url=self.database_url,
+                )
+                if self.audit_required:
+                    round_mgr.transition_to(RoundState.FAILED)
+                    raise
+
+        self._persist_client_update(upd)
+
+    def get_remote_client_task(self, client_id: str) -> dict[str, Any]:
+        """Return the current round assignment and serialized shared state for a remote client."""
+        cid = client_id.strip()
+        if cid not in self.remote_client_ids:
+            raise ValueError(
+                f"Client '{cid}' is not configured as a remote client for experiment '{self.experiment_id}'. "
+                f"Configured remote_client_ids={list(self.remote_client_ids)}."
+            )
+
+        with self._remote_cond:
+            if self._terminal_state in ("COMPLETED", "FAILED", "CANCELLED"):
+                return {
+                    "status": self._terminal_state,
+                    "experiment_id": self.experiment_id,
+                    "client_id": cid,
+                    "completed_rounds": len(self.completed_rounds),
+                    "awaiting_submission": False,
+                }
+            if self._active_round_mgr is None or self._active_round_num is None:
+                return {
+                    "status": "WAITING_FOR_ROUND",
+                    "experiment_id": self.experiment_id,
+                    "client_id": cid,
+                    "completed_rounds": len(self.completed_rounds),
+                    "awaiting_submission": False,
+                }
+            if cid in self._active_round_mgr._submissions:
+                return {
+                    "status": "ALREADY_SUBMITTED",
+                    "experiment_id": self.experiment_id,
+                    "round_num": self._active_round_num,
+                    "client_id": cid,
+                    "awaiting_submission": False,
+                }
+
+            return {
+                "status": "READY",
+                "awaiting_submission": True,
+                "experiment_id": self.experiment_id,
+                "round_num": self._active_round_num,
+                "client_id": cid,
+                "task_type": self.task_type,
+                "algorithm": self.algorithm,
+                "adapter_kwargs": self.adapter_kwargs,
+                "round_config": dict(self._active_round_config),
+                "hyperparameters": {
+                    **dict(self._active_round_config),
+                    "adapter_kwargs": dict(self.adapter_kwargs),
+                },
+                "shared_state_hash": self._active_shared_hash,
+                "global_shared_hash": self._active_shared_hash,
+                "shared_state_b64": self._active_shared_b64,
+                "knowledge_bank_b64": self._active_bank_b64,
+                "knowledge_bank_metadata": list(self._active_bank_metadata),
+            }
+
+    def submit_remote_client_update(self, update: ClientUpdatePayload) -> dict[str, Any]:
+        """Validate and accept an update submitted over HTTP by a remote client."""
+        cid = update.client_id.strip()
+        if cid not in self.remote_client_ids:
+            raise AggregationValidationError(
+                f"Client '{cid}' is not registered as a remote worker for experiment '{self.experiment_id}'."
+            )
+
+        with self._remote_cond:
+            if self._active_round_mgr is None or self._active_round_num is None:
+                raise RoundStateTransitionError(
+                    f"Experiment '{self.experiment_id}' has no active round awaiting remote updates."
+                )
+            if update.experiment_id != self.experiment_id:
+                raise AggregationValidationError(
+                    f"Experiment ID mismatch: expected '{self.experiment_id}', got '{update.experiment_id}'."
+                )
+            if int(update.round_num) != int(self._active_round_num):
+                raise AggregationValidationError(
+                    f"Round number mismatch for '{cid}': expected active round {self._active_round_num}, got {update.round_num}."
+                )
+
+            recomputed_hash = hash_state_dict(update.shared_state_dict)
+            declared_hash = normalize_bytes32_hex(update.update_hash)
+            if recomputed_hash != declared_hash:
+                raise AggregationValidationError(
+                    f"Declared update_hash {declared_hash} does not match recomputed canonical hash {recomputed_hash}."
+                )
+            update.update_hash = recomputed_hash
+
+            self._record_and_accept_client_update(
+                round_mgr=self._active_round_mgr,
+                round_num=self._active_round_num,
+                upd=update,
+            )
+            self._active_round_peak_vram = max(
+                self._active_round_peak_vram, float(update.peak_vram_mb)
+            )
+            append_experiment_log(
+                experiment_id=self.experiment_id,
+                message=(
+                    f"Accepted remote update from {cid} for Round {self._active_round_num} "
+                    f"(device={update.eval_metrics.get('device', 'cpu')}, samples={update.num_samples}, "
+                    f"hash={recomputed_hash[:14]}..., audit={update.blockchain_status})."
+                ),
+                database_url=self.database_url,
+            )
+            self._remote_cond.notify_all()
+            return {
+                "status": "ACCEPTED",
+                "experiment_id": self.experiment_id,
+                "round_num": int(self._active_round_num),
+                "client_id": cid,
+                "update_hash": recomputed_hash,
+                "blockchain_status": update.blockchain_status,
+                "tx_hash": update.blockchain_tx_hash,
+                "quorum_met": self._active_round_mgr.check_quorum_met(),
+            }
+
     def run_round(
         self,
         round_num: int,
@@ -318,6 +594,8 @@ class FederatedLearningServer:
         fedprox_mu: float = 0.01,
         scale: int = 2,
         device: torch.device | str | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        remote_timeout_sec: float | None = None,
     ) -> RoundExecutionResult:
         """Execute a single communication round across all configured hospital clients."""
         if round_num in self.completed_rounds:
@@ -350,138 +628,133 @@ class FederatedLearningServer:
             database_url=self.database_url,
         )
 
-        # Dispatch clients sequentially with current global shared state and bank snapshot
         round_peak_vram = 0.0
         audit_status = "NOT_CONFIGURED"
 
-        for cid in self.client_ids:
-            client = self.clients[cid]
-            upd = client.train_round(
-                experiment_id=self.experiment_id,
-                round_num=round_num,
-                shared_state_dict=self.global_shared_state,
-                knowledge_bank=self.knowledge_bank,
-                policy=self.policy,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                max_train_samples=max_train_samples,
-                max_val_samples=max_val_samples,
-                lr=lr,
-                fedprox_mu=fedprox_mu,
-                scale=scale,
-                device=device,
-                seed=self.seed,
-                reusable_adapter=self._worker_adapter,
-            )
-            round_peak_vram = max(round_peak_vram, upd.peak_vram_mb)
+        if self.remote_client_ids:
+            with self._remote_cond:
+                self._active_round_mgr = round_mgr
+                self._active_round_num = round_num
+                self._active_round_peak_vram = 0.0
+                self._active_round_config = {
+                    "local_epochs": int(
+                        local_epochs if local_epochs is not None else self.cfg.default_local_epochs
+                    ),
+                    "batch_size": batch_size,
+                    "max_train_samples": max_train_samples,
+                    "max_val_samples": max_val_samples,
+                    "lr": float(lr),
+                    "fedprox_mu": float(fedprox_mu),
+                    "scale": int(scale),
+                    "seed": int(self.seed),
+                }
+                self._active_shared_hash = hash_state_dict(self.global_shared_state)
+                self._active_shared_b64 = base64.b64encode(
+                    serialize_state_dict_canonical(self.global_shared_state)
+                ).decode("ascii")
+                if len(self.knowledge_bank) > 0:
+                    self._active_bank_b64 = base64.b64encode(
+                        serialize_state_dict_canonical(
+                            {"embeddings": self.knowledge_bank.embeddings}
+                        )
+                    ).decode("ascii")
+                    self._active_bank_metadata = [
+                        m.to_dict() for m in self.knowledge_bank.metadata
+                    ]
+                else:
+                    self._active_bank_b64 = None
+                    self._active_bank_metadata = []
 
-            # Save client shared update artifact metadata off-chain
-            client_upd_path = (
-                self.exp_artifact_dir / "clients" / cid / f"shared_update_r{round_num}.pt"
-            )
-            if round_num <= 1:
-                client_upd_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(upd.shared_state_dict, client_upd_path)
-            record_artifact_metadata(
-                artifact_id=f"{self.experiment_id}_r{round_num}_{cid}_update",
-                experiment_id=self.experiment_id,
-                task_type=self.task_type,
-                round_num=round_num,
-                client_id=cid,
-                artifact_type="client_update",
-                file_path=str(client_upd_path),
-                sha256_hash=upd.update_hash,
-                database_url=self.database_url,
-            )
+        try:
+            # 1. Execute local clients sequentially on this machine
+            for cid in self.client_ids:
+                if cid in self.remote_client_ids:
+                    continue
+                client = self.clients[cid]
+                upd = client.train_round(
+                    experiment_id=self.experiment_id,
+                    round_num=round_num,
+                    shared_state_dict=self.global_shared_state,
+                    knowledge_bank=self.knowledge_bank,
+                    policy=self.policy,
+                    local_epochs=local_epochs,
+                    batch_size=batch_size,
+                    max_train_samples=max_train_samples,
+                    max_val_samples=max_val_samples,
+                    lr=lr,
+                    fedprox_mu=fedprox_mu,
+                    scale=scale,
+                    device=device,
+                    seed=self.seed,
+                    reusable_adapter=self._worker_adapter,
+                )
+                eff_dev = str(
+                    device
+                    if device is not None
+                    else ("cuda" if torch.cuda.is_available() else "cpu")
+                )
+                upd.eval_metrics["device"] = eff_dev
+                round_peak_vram = max(round_peak_vram, upd.peak_vram_mb)
 
-            # Submit client update hash to blockchain if connector configured
-            if self.web3_connector is not None:
-                try:
-                    if hasattr(self.web3_connector, "ensure_hospital_registered"):
-                        reg_rec = self.web3_connector.ensure_hospital_registered(
-                            client_id=cid,
-                            hospital_name=f"Hospital_{cid}",
-                            modality=self.task_type,
+                if self.remote_client_ids:
+                    with self._remote_cond:
+                        self._record_and_accept_client_update(round_mgr, round_num, upd)
+                        self._active_round_peak_vram = max(
+                            self._active_round_peak_vram, round_peak_vram
                         )
-                        reg_tx_hash = (
-                            reg_rec.get("tx_hash")
-                            if isinstance(reg_rec, dict)
-                            else getattr(reg_rec, "tx_hash", None)
-                        )
-                        reg_block = (
-                            reg_rec.get("block_number")
-                            if isinstance(reg_rec, dict)
-                            else getattr(reg_rec, "block_number", None)
-                        )
-                        reg_sender = (
-                            reg_rec.get("sender") or reg_rec.get("wallet")
-                            if isinstance(reg_rec, dict)
-                            else getattr(reg_rec, "sender", None)
-                        )
-                        if isinstance(reg_tx_hash, str) and reg_tx_hash:
-                            record_blockchain_tx(
-                                action_type="HospitalRegistered",
-                                status="CONFIRMED",
-                                experiment_id=self.experiment_id,
-                                task_type=self.task_type,
-                                round_num=round_num,
-                                client_id=cid,
-                                tx_hash=reg_tx_hash,
-                                block_number=int(reg_block) if reg_block is not None else None,
-                                wallet_address=str(reg_sender) if reg_sender else None,
-                                database_url=self.database_url,
-                            )
-                    already_submitted = False
-                    if isinstance(self.web3_connector, Web3Connector):
-                        sub_state = self.web3_connector.get_client_submission(
-                            self.experiment_id, round_num, cid
-                        )
-                        already_submitted = bool(sub_state.get("exists"))
+                else:
+                    self._record_and_accept_client_update(round_mgr, round_num, upd)
 
-                    if already_submitted:
-                        upd.blockchain_status = "CONFIRMED"
-                    else:
-                        tx_rec = self.web3_connector.submit_model_update(
+            # 2. If distributed remote clients are configured, wait for their submissions
+            if self.remote_client_ids:
+                eff_timeout = float(
+                    remote_timeout_sec
+                    if remote_timeout_sec is not None
+                    else self.remote_round_timeout_sec
+                )
+                deadline = time.monotonic() + eff_timeout
+                with self._remote_cond:
+                    missing = [
+                        c for c in self.remote_client_ids if c not in round_mgr._submissions
+                    ]
+                    if missing:
+                        append_experiment_log(
                             experiment_id=self.experiment_id,
-                            round_num=round_num,
-                            task_type=self.task_type,
-                            model_hash=upd.update_hash,
-                            client_id=cid,
-                        )
-                        upd.blockchain_tx_hash = tx_rec.tx_hash
-                        upd.blockchain_status = "CONFIRMED"
-                        record_blockchain_tx(
-                            action_type="ModelUpdateSubmitted",
-                            status="CONFIRMED",
-                            experiment_id=self.experiment_id,
-                            task_type=self.task_type,
-                            round_num=round_num,
-                            client_id=cid,
-                            artifact_hash=upd.update_hash,
-                            tx_hash=tx_rec.tx_hash,
-                            block_number=tx_rec.block_number,
-                            wallet_address=tx_rec.sender,
+                            message=(
+                                f"Round {round_num}: waiting for remote client(s) {missing} "
+                                f"(timeout={eff_timeout:.0f}s)..."
+                            ),
                             database_url=self.database_url,
                         )
-                except BlockchainError as exc:
-                    upd.blockchain_status = "FAILED"
-                    record_blockchain_tx(
-                        action_type="ModelUpdateSubmitted",
-                        status="FAILED",
-                        experiment_id=self.experiment_id,
-                        task_type=self.task_type,
-                        round_num=round_num,
-                        client_id=cid,
-                        artifact_hash=upd.update_hash,
-                        error_message=str(exc),
-                        database_url=self.database_url,
-                    )
-                    if self.audit_required:
-                        round_mgr.transition_to(RoundState.FAILED)
-                        raise
-
-            round_mgr.accept_client_update(upd)
-            self._persist_client_update(upd)
+                    while not round_mgr.check_quorum_met():
+                        if should_cancel is not None and should_cancel():
+                            round_mgr.transition_to(RoundState.CANCELLED)
+                            self._terminal_state = RoundState.CANCELLED.value
+                            raise RuntimeError(
+                                f"Round {round_num} cancelled while waiting for remote clients."
+                            )
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            still_missing = [
+                                c
+                                for c in self.remote_client_ids
+                                if c not in round_mgr._submissions
+                            ]
+                            round_mgr.transition_to(RoundState.FAILED)
+                            self._terminal_state = RoundState.FAILED.value
+                            raise TimeoutError(
+                                f"Timed out after {eff_timeout:.1f}s waiting for remote client(s) "
+                                f"{still_missing} in round {round_num}."
+                            )
+                        self._remote_cond.wait(timeout=min(0.5, remaining))
+                    round_peak_vram = max(round_peak_vram, self._active_round_peak_vram)
+        finally:
+            if self.remote_client_ids:
+                with self._remote_cond:
+                    self._active_round_mgr = None
+                    self._active_round_num = None
+                    self._active_shared_b64 = None
+                    self._active_bank_b64 = None
 
         # Validate submissions and run weighted FedAvg once
         self.global_shared_state = round_mgr.validate_and_aggregate()
@@ -635,6 +908,7 @@ class FederatedLearningServer:
         try:
             for r in range(start_round, num_rounds + 1):
                 if should_cancel is not None and should_cancel():
+                    self._terminal_state = RoundState.CANCELLED.value
                     create_or_update_experiment(
                         experiment_id=self.experiment_id,
                         task_type=self.task_type,
@@ -648,9 +922,10 @@ class FederatedLearningServer:
                     )
                     return results
 
-                res = self.run_round(round_num=r, **round_kwargs)
+                res = self.run_round(round_num=r, should_cancel=should_cancel, **round_kwargs)
                 results.append(res)
 
+            self._terminal_state = RoundState.COMPLETED.value
             create_or_update_experiment(
                 experiment_id=self.experiment_id,
                 task_type=self.task_type,
@@ -665,6 +940,7 @@ class FederatedLearningServer:
             )
             return results
         except Exception as exc:
+            self._terminal_state = RoundState.FAILED.value
             create_or_update_experiment(
                 experiment_id=self.experiment_id,
                 task_type=self.task_type,

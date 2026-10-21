@@ -29,6 +29,8 @@ from backend.database.models import (
     MetricRecord,
     TrainingRound,
 )
+from backend.fl.protocols import ClientUpdatePayload
+from backend.fl.round_manager import RoundStateTransitionError
 from backend.fl.server import FederatedLearningServer
 from backend.services.artifact_service import CheckpointNotFoundError
 from backend.utils.logging import setup_logger
@@ -330,6 +332,25 @@ class TrainingJobManager:
             if not client_ids:
                 raise ValueError("client_ids cannot be empty.")
 
+            raw_remote = job_cfg.get("remote_client_ids", []) or []
+            remote_client_ids = tuple(str(c).strip() for c in raw_remote if str(c).strip())
+            if remote_client_ids:
+                unknown = [c for c in remote_client_ids if c not in client_ids]
+                if unknown:
+                    raise ValueError(
+                        f"remote_client_ids {unknown} must be a subset of client_ids {list(client_ids)}."
+                    )
+                token_val = active_cfg.fl_client_auth_token.get_secret_value().strip()
+                if not token_val:
+                    raise ValueError(
+                        "Distributed mode requires FL_CLIENT_AUTH_TOKEN to be explicitly configured "
+                        "(non-empty) in .env or environment."
+                    )
+
+            remote_timeout = float(
+                job_cfg.get("remote_round_timeout_sec", active_cfg.distributed_round_timeout_sec)
+            )
+
             adapter_kwargs: dict[str, Any] = {}
             if task == "superresolution":
                 adapter_kwargs["default_scale"] = scale_factor
@@ -343,6 +364,8 @@ class TrainingJobManager:
                 task_type=task,
                 algorithm=algorithm,  # type: ignore[arg-type]
                 client_ids=client_ids,
+                remote_client_ids=remote_client_ids,
+                remote_round_timeout_sec=remote_timeout,
                 cfg=active_cfg,
                 database_url=db_url,
                 web3_connector=web3_connector,
@@ -356,6 +379,9 @@ class TrainingJobManager:
                 "algorithm": algorithm,
                 "num_rounds": int(num_rounds),
                 "client_ids": list(client_ids),
+                "remote_client_ids": list(remote_client_ids),
+                "execution_mode": "distributed" if remote_client_ids else "single_laptop",
+                "remote_round_timeout_sec": remote_timeout,
                 "local_epochs": int(job_cfg.get("local_epochs", active_cfg.default_local_epochs)),
                 "learning_rate": float(job_cfg.get("learning_rate", 1e-3)),
                 "batch_size": int(job_cfg.get("batch_size", 4)),
@@ -421,6 +447,8 @@ class TrainingJobManager:
             "algorithm": algorithm,
             "status": "CREATED" if run_async else self.get_training_status(exp_id, database_url=db_url)["status"],
             "total_rounds": int(num_rounds),
+            "execution_mode": full_config["execution_mode"],
+            "remote_client_ids": list(remote_client_ids),
         }
 
     def _execute_job_worker(
@@ -435,6 +463,7 @@ class TrainingJobManager:
         """Background worker executing sequential federated rounds."""
         try:
             if experiment_id in self._cancel_requested:
+                server._terminal_state = "CANCELLED"
                 create_or_update_experiment(
                     experiment_id=experiment_id,
                     task_type=server.task_type,
@@ -457,9 +486,13 @@ class TrainingJobManager:
             max_samples = job_config.get("max_samples", 16)
             batch_size = int(job_config.get("batch_size", 4))
             scale_factor = int(job_config.get("scale_factor", 2))
+            remote_timeout = float(
+                job_config.get("remote_round_timeout_sec", server.remote_round_timeout_sec)
+            )
 
             for r in range(start_round, total_rounds + 1):
                 if experiment_id in self._cancel_requested:
+                    server._terminal_state = "CANCELLED"
                     create_or_update_experiment(
                         experiment_id=experiment_id,
                         task_type=server.task_type,
@@ -482,8 +515,11 @@ class TrainingJobManager:
                     fedprox_mu=float(job_config.get("fedprox_mu", 0.01)),
                     scale=scale_factor,
                     device=device,
+                    should_cancel=lambda: experiment_id in self._cancel_requested,
+                    remote_timeout_sec=remote_timeout,
                 )
 
+            server._terminal_state = "COMPLETED"
             peak_vram = max(
                 (res.peak_vram_mb for res in server.completed_rounds.values()),
                 default=0.0,
@@ -501,6 +537,7 @@ class TrainingJobManager:
             )
         except Exception as exc:
             status = "CANCELLED" if "cancelled" in str(exc).lower() else "FAILED"
+            server._terminal_state = status
             logger.error("Job %s terminated with %s: %s", experiment_id, status, exc)
             with session_scope(database_url) as session:
                 exp = session.execute(
@@ -550,6 +587,10 @@ class TrainingJobManager:
 
         with self._lock:
             self._cancel_requested.add(training_id)
+            active_srv = self._active_servers.get(training_id)
+        if active_srv is not None:
+            with active_srv._remote_cond:
+                active_srv._remote_cond.notify_all()
 
         create_or_update_experiment(
             experiment_id=training_id,
@@ -621,12 +662,18 @@ class TrainingJobManager:
                     )
 
             client_ids = tuple(exp_config.get("client_ids", ["client_1", "client_2", "client_3"]))
+            remote_client_ids = tuple(exp_config.get("remote_client_ids", []) or [])
+            remote_timeout = float(
+                exp_config.get("remote_round_timeout_sec", active_cfg.distributed_round_timeout_sec)
+            )
             adapter_kwargs = dict(exp_config.get("adapter_kwargs") or {})
             server = FederatedLearningServer(
                 experiment_id=training_id,
                 task_type=exp_task,
                 algorithm=exp_alg,  # type: ignore[arg-type]
                 client_ids=client_ids,
+                remote_client_ids=remote_client_ids,
+                remote_round_timeout_sec=remote_timeout,
                 cfg=active_cfg,
                 database_url=db_url,
                 web3_connector=web3_connector,
@@ -793,16 +840,42 @@ class TrainingJobManager:
                         "peak_vram_mb": cu.peak_vram_mb,
                     }
 
+            cfg_dict = exp.config_json if isinstance(exp.config_json, dict) else {}
+            remote_cids = set(cfg_dict.get("remote_client_ids", []) or [])
+            participating_cids = set(
+                cfg_dict.get("client_ids", ["client_1", "client_2", "client_3"])
+            )
+
+            awaiting_remote: list[str] = []
+            with self._lock:
+                active_srv = self._active_servers.get(exp_id)
+            if active_srv is not None and active_srv.remote_client_ids:
+                with active_srv._remote_cond:
+                    if active_srv._active_round_mgr is not None:
+                        awaiting_remote = [
+                            c
+                            for c in active_srv.remote_client_ids
+                            if c not in active_srv._active_round_mgr._submissions
+                        ]
+
             client_status_list = []
             for h in hospitals:
                 cu_info = latest_by_client.get(h.client_id)
+                is_remote = h.client_id in remote_cids
+                is_participating = h.client_id in participating_cids
                 client_status_list.append(
                     {
                         "client_id": h.client_id,
                         "hospital_name": h.hospital_name,
                         "modality": h.modality,
                         "wallet_address": h.wallet_address,
-                        "status": h.status,
+                        "status": (
+                            "AWAITING_REMOTE_UPDATE"
+                            if h.client_id in awaiting_remote
+                            else ("EXCLUDED" if not is_participating else h.status)
+                        ),
+                        "execution_mode": "remote" if is_remote else "local",
+                        "participating": is_participating,
                         "latest_update": cu_info,
                     }
                 )
@@ -813,6 +886,11 @@ class TrainingJobManager:
                 "task_type": exp.task_type,
                 "algorithm": exp.algorithm,
                 "status": exp.status,
+                "execution_mode": cfg_dict.get(
+                    "execution_mode", "distributed" if remote_cids else "single_laptop"
+                ),
+                "remote_client_ids": sorted(remote_cids),
+                "awaiting_remote_clients": awaiting_remote,
                 "current_round": exp.current_round,
                 "total_rounds": exp.total_rounds,
                 "seed": exp.seed,
@@ -833,6 +911,87 @@ class TrainingJobManager:
                 "clients": client_status_list,
                 "updated_at": exp.updated_at.isoformat() if exp.updated_at else None,
             }
+
+    def get_remote_client_task(
+        self,
+        client_id: str,
+        experiment_id: str | None = None,
+        database_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the current round assignment for remote worker `client_id`."""
+        cid = (client_id or "").strip()
+        if not cid:
+            raise ValueError("client_id is required.")
+
+        db_url = database_url or settings.database_url
+        with self._lock:
+            target_server: FederatedLearningServer | None = None
+            if experiment_id:
+                target_server = self._active_servers.get(experiment_id)
+            else:
+                # Prefer an active server whose background worker is alive and expects cid
+                for exp_id_key in reversed(list(self._active_servers.keys())):
+                    srv = self._active_servers[exp_id_key]
+                    if cid in srv.remote_client_ids:
+                        th = self._active_threads.get(exp_id_key)
+                        if th is not None and th.is_alive():
+                            target_server = srv
+                            break
+                if target_server is None:
+                    for exp_id_key in reversed(list(self._active_servers.keys())):
+                        srv = self._active_servers[exp_id_key]
+                        if cid in srv.remote_client_ids:
+                            target_server = srv
+                            break
+
+        if target_server is not None:
+            return target_server.get_remote_client_task(cid)
+
+        if experiment_id:
+            with session_scope(db_url) as session:
+                exp = session.execute(
+                    select(Experiment).where(Experiment.experiment_id == experiment_id)
+                ).scalar_one_or_none()
+                if exp is None:
+                    raise LookupError(f"Experiment '{experiment_id}' not found.")
+                return {
+                    "experiment_id": exp.experiment_id,
+                    "round_num": exp.current_round,
+                    "status": exp.status,
+                    "task_type": exp.task_type,
+                    "algorithm": exp.algorithm,
+                    "client_id": cid,
+                    "awaiting_submission": False,
+                }
+
+        return {
+            "experiment_id": None,
+            "round_num": None,
+            "status": "IDLE",
+            "client_id": cid,
+            "awaiting_submission": False,
+        }
+
+    def submit_remote_client_update(
+        self,
+        experiment_id: str,
+        round_num: int,
+        update: ClientUpdatePayload,
+    ) -> dict[str, Any]:
+        """Submit a validated remote client update to the active `FederatedLearningServer`."""
+        with self._lock:
+            server = self._active_servers.get(experiment_id)
+        if server is None:
+            raise LookupError(f"Active experiment '{experiment_id}' not found on coordinator.")
+        with server._remote_cond:
+            if server._active_round_num != int(round_num):
+                raise RoundStateTransitionError(
+                    f"Experiment '{experiment_id}' is at active round {server._active_round_num}, "
+                    f"cannot accept submission for round {round_num}."
+                )
+            update.task_type = server.task_type
+            update.algorithm = server.algorithm
+        return server.submit_remote_client_update(update)
 
     def get_training_logs(
         self,
