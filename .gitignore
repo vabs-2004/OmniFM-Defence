@@ -22,6 +22,7 @@ frontend/build/
 datasets/
 artifacts/
 test/
+tests/
 *.pt
 *.pth
 *.ckpt
@@ -38,4 +39,4 @@ test/
 # Logs & Generated Outputs
 logs/
 *.log
-tmp/
+tmp/
