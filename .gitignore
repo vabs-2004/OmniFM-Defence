@@ -26,7 +26,8 @@ test/
 *.pth
 *.ckpt
 *.onnx
-
+paper/
+user_prompt.txt
 # Databases
 *.db
 *.db-journal
