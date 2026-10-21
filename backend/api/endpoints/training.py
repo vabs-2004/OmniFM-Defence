@@ -32,6 +32,10 @@ class TrainingStartRequest(BaseModel):
 
     task_type: str = Field(..., description="classification | segmentation | superresolution | fusion")
     num_rounds: int = Field(default=20, ge=1, le=100, description="Number of federated rounds")
+    execution_mode: str = Field(
+        default="single_laptop",
+        description="single_laptop (default failsafe) | distributed_two_laptop",
+    )
     config: dict[str, Any] = Field(default_factory=dict, description="Algorithm, batch size, ablation flags")
     training_id: str | None = Field(default=None, description="Optional explicit experiment identifier")
     run_async: bool = Field(default=True, description="Run training asynchronously in background thread")
@@ -121,6 +125,7 @@ def start_training_endpoint(payload: TrainingStartRequest, request: Request) -> 
         return mgr.start_training(
             task_type=payload.task_type,
             num_rounds=payload.num_rounds,
+            execution_mode=payload.execution_mode,
             config=payload.config,
             training_id=payload.training_id,
             cfg=_get_settings(request),

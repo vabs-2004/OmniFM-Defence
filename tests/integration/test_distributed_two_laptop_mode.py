@@ -110,10 +110,22 @@ class TestDistributedTwoLaptopAndSingleLaptopFailsafe(unittest.TestCase):
         self.checkpoints_dir = self.artifacts_dir / "checkpoints"
         self.experiments_dir = self.artifacts_dir / "experiments"
         self.logs_dir = self.root_path / "logs"
+        self.active_mgrs: list[TrainingJobManager] = []
         init_db(self.db_url)
 
     def tearDown(self) -> None:
-        self.tmp_dir.cleanup()
+        import gc
+        for mgr in getattr(self, "active_mgrs", []):
+            with mgr._lock:
+                threads = list(mgr._active_threads.values())
+            for th in threads:
+                if th.is_alive():
+                    th.join(timeout=3.0)
+        gc.collect()
+        try:
+            self.tmp_dir.cleanup()
+        except Exception:
+            pass
 
     def _make_settings(self, token: str = "") -> Settings:
         return Settings(
@@ -410,6 +422,227 @@ class TestDistributedTwoLaptopAndSingleLaptopFailsafe(unittest.TestCase):
                 device="cpu",
                 remote_timeout_sec=0.3,
             )
+
+    def test_concurrent_start_returns_409_while_job_is_active(self) -> None:
+        """An actually active job returns 409 for a second conflicting start."""
+        mgr = TrainingJobManager()
+        self.active_mgrs.append(mgr)
+        cfg = self._make_settings()
+        app = create_app(settings=cfg, database_url=self.db_url, job_manager=mgr)
+        client = TestClient(app)
+
+        # Start job 1 in async background mode
+        res1 = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "config": {"batch_size": 4, "max_samples": 4, "local_epochs": 1},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res1.status_code, 200, res1.text)
+        job1_id = res1.json()["training_id"]
+
+        # Attempting to start a second job while job 1's worker is active must return HTTP 409
+        res2 = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "config": {"batch_size": 4, "max_samples": 4},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res2.status_code, 409)
+        self.assertIn("currently active on the single GPU", res2.json()["detail"])
+
+        # Cancel and clean up job 1
+        client.post(f"/api/training/{job1_id}/cancel")
+        for _ in range(50):
+            st = client.get("/api/training/status", params={"training_id": job1_id}).json()
+            if st["status"] in ("COMPLETED", "FAILED", "CANCELLED"):
+                break
+            time.sleep(0.1)
+
+    def test_completed_job_releases_lock_and_permits_next_job(self) -> None:
+        """A successfully completed job releases the active-job marker/lock and permits the next job."""
+        mgr = TrainingJobManager()
+        self.active_mgrs.append(mgr)
+        cfg = self._make_settings()
+        app = create_app(settings=cfg, database_url=self.db_url, job_manager=mgr)
+        client = TestClient(app)
+
+        res1 = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "config": {"batch_size": 4, "max_samples": 4, "local_epochs": 1},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res1.status_code, 200)
+        job1_id = res1.json()["training_id"]
+
+        for _ in range(50):
+            st = client.get("/api/training/status", params={"training_id": job1_id}).json()
+            if st["status"] == "COMPLETED":
+                break
+            time.sleep(0.1)
+
+        # Job 1 is completed. Now starting job 2 must succeed without 409
+        res2 = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "config": {"batch_size": 4, "max_samples": 4, "local_epochs": 1},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res2.status_code, 200, res2.text)
+        job2_id = res2.json()["training_id"]
+        self.assertNotEqual(job1_id, job2_id)
+
+        # Clean up job 2
+        client.post(f"/api/training/{job2_id}/cancel")
+        th = mgr._active_threads.get(job2_id)
+        if th is not None and th.is_alive():
+            th.join(timeout=3.0)
+        for _ in range(50):
+            st = client.get("/api/training/status", params={"training_id": job2_id}).json()
+            if st["status"] in ("COMPLETED", "FAILED", "CANCELLED"):
+                break
+            time.sleep(0.1)
+
+    def test_acknowledged_safe_cancellation_releases_lock_and_permits_next_job(self) -> None:
+        """An acknowledged safe cancellation releases the lock and permits the next job."""
+        mgr = TrainingJobManager()
+        self.active_mgrs.append(mgr)
+        cfg = self._make_settings()
+        app = create_app(settings=cfg, database_url=self.db_url, job_manager=mgr)
+        client = TestClient(app)
+
+        res1 = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 5,
+                "config": {"batch_size": 4, "max_samples": 4, "local_epochs": 2},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res1.status_code, 200)
+        job1_id = res1.json()["training_id"]
+
+        # Cancel job 1
+        cancel_res = client.post(f"/api/training/{job1_id}/cancel")
+        self.assertEqual(cancel_res.status_code, 200)
+
+        # Wait until job 1 reaches terminal state
+        for _ in range(50):
+            st = client.get("/api/training/status", params={"training_id": job1_id}).json()
+            if st["status"] == "CANCELLED":
+                break
+            time.sleep(0.1)
+
+        self.assertEqual(client.get("/api/training/status", params={"training_id": job1_id}).json()["status"], "CANCELLED")
+
+        # Now starting next job must succeed
+        res2 = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "config": {"batch_size": 4, "max_samples": 4, "local_epochs": 1},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res2.status_code, 200, res2.text)
+
+    def test_stale_active_job_marker_handled_safely_without_deleting_history(self) -> None:
+        """A dead or terminated thread in in-memory tracking is safely reconciled without deleting DB records."""
+        mgr = TrainingJobManager()
+        self.active_mgrs.append(mgr)
+        cfg = self._make_settings()
+        app = create_app(settings=cfg, database_url=self.db_url, job_manager=mgr)
+        client = TestClient(app)
+
+        # Simulate a completed background thread that remained in _active_threads
+        dead_thread = threading.Thread(target=lambda: None)
+        dead_thread.start()
+        dead_thread.join()
+
+        with mgr._lock:
+            mgr._active_threads["stale_job_123"] = dead_thread
+
+        # start_training must reconcile the dead thread and allow starting the new job
+        res = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "config": {"batch_size": 4, "max_samples": 4, "local_epochs": 1},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        with mgr._lock:
+            self.assertNotIn("stale_job_123", mgr._active_threads)
+
+    def test_distributed_mode_selection_and_status_agreement(self) -> None:
+        """Starting a job with execution_mode='distributed_two_laptop' records and returns mode='distributed'."""
+        cfg = self._make_settings(token="dist-agreement-token")
+        mgr = TrainingJobManager()
+        self.active_mgrs.append(mgr)
+        app = create_app(settings=cfg, database_url=self.db_url, job_manager=mgr)
+        client = TestClient(app)
+
+        res = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "classification",
+                "num_rounds": 1,
+                "execution_mode": "distributed_two_laptop",
+                "config": {"batch_size": 4, "max_samples": 4, "remote_round_timeout_sec": 0.5},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        job_id = res.json()["training_id"]
+        self.assertEqual(res.json()["execution_mode"], "distributed")
+        self.assertEqual(res.json()["remote_client_ids"], ["client_2"])
+
+        st = client.get("/api/training/status", params={"training_id": job_id}).json()
+        self.assertEqual(st["execution_mode"], "distributed")
+        self.assertEqual(st["remote_client_ids"], ["client_2"])
+
+        # Cancel to clean up
+        client.post(f"/api/training/{job_id}/cancel")
+
+    def test_distributed_mode_rejects_unsupported_fusion_task_early(self) -> None:
+        """Selecting distributed mode for 'fusion' must fail fast with HTTP 400 and clear error."""
+        cfg = self._make_settings(token="dist-fusion-token")
+        mgr = TrainingJobManager()
+        self.active_mgrs.append(mgr)
+        app = create_app(settings=cfg, database_url=self.db_url, job_manager=mgr)
+        client = TestClient(app)
+
+        res = client.post(
+            "/api/training/start",
+            json={
+                "task_type": "fusion",
+                "num_rounds": 1,
+                "execution_mode": "distributed_two_laptop",
+                "config": {"batch_size": 2, "max_samples": 4},
+                "run_async": True,
+            },
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("Two-laptop distributed execution is currently validated for 'classification'", res.json()["detail"])
+        self.assertIn("Distributed execution for 'fusion' is not yet supported", res.json()["detail"])
+
 
 
 if __name__ == "__main__":

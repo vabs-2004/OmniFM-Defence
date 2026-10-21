@@ -65,6 +65,15 @@ export default function TrainingControl() {
     e.preventDefault();
     setSubmitting(true);
     setError("");
+
+    if (executionMode === "distributed_two_laptop" && taskType !== "classification") {
+      setError(
+        "Two-Laptop Distributed mode currently supports Classification (client_1 GPU DermaMNIST + client_2 Remote CPU PathMNIST). For Multimodal Fusion, Segmentation, or Super-Resolution, please select Single-Laptop Failsafe mode."
+      );
+      setSubmitting(false);
+      return;
+    }
+
     try {
       const modeConfig =
         executionMode === "distributed_two_laptop"
@@ -76,8 +85,10 @@ export default function TrainingControl() {
       const res = await omnifmApi.startTraining({
         task_type: taskType,
         num_rounds: Number(numRounds),
+        execution_mode: executionMode,
         run_async: true,
         config: {
+          execution_mode: executionMode,
           algorithm,
           local_epochs: Number(localEpochs),
           batch_size: Number(batchSize),
@@ -328,12 +339,19 @@ export default function TrainingControl() {
                 <div className="text-xs text-slate-400 font-mono mt-0.5">
                   ID: {statusData?.training_id || "None"} • Mode:{" "}
                   <span className="text-emerald-300 font-semibold">
-                    {statusData?.execution_mode === "distributed"
+                    {statusData?.execution_mode === "distributed" ||
+                    statusData?.execution_mode === "distributed_two_laptop"
                       ? "DISTRIBUTED (2-LAPTOP)"
                       : "SINGLE-LAPTOP"}
                   </span>{" "}
                   • Status:{" "}
-                  <span className="text-indigo-300 font-semibold">
+                  <span
+                    className={
+                      statusData?.status === "CANCELLING"
+                        ? "text-amber-400 font-semibold animate-pulse"
+                        : "text-indigo-300 font-semibold"
+                    }
+                  >
                     {statusData?.status || "IDLE"}
                   </span>{" "}
                   • Round {statusData?.current_round ?? 0}/

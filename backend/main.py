@@ -28,14 +28,22 @@ def create_app(
     database_url: str | None = None,
     web3_connector: Web3Connector | None = None,
     job_manager_instance: TrainingJobManager | None = None,
+    job_manager: TrainingJobManager | None = None,
+    settings: Any | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application instance."""
-    db_url = database_url or settings.database_url
+    from backend.config import settings as default_settings
+
+    active_settings = settings or default_settings
+    db_url = database_url or active_settings.database_url
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
         init_db(app_instance.state.database_url)
-        ensure_default_hospitals(cfg=settings, database_url=app_instance.state.database_url)
+        ensure_default_hospitals(
+            cfg=getattr(app_instance.state, "settings", default_settings),
+            database_url=app_instance.state.database_url,
+        )
         yield
 
     application = FastAPI(
@@ -49,11 +57,12 @@ def create_app(
     )
 
     application.state.database_url = db_url
+    application.state.settings = active_settings
     application.state.job_manager = job_manager_instance or job_manager
     if web3_connector is not None:
         application.state.web3_connector = web3_connector
 
-    raw_origins = settings.cors_origins
+    raw_origins = active_settings.cors_origins
     if isinstance(raw_origins, str):
         cors_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
     else:

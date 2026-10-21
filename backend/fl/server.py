@@ -38,6 +38,7 @@ from backend.database.db import (
 )
 from backend.database.models import (
     ClientUpdate,
+    Experiment,
     GlobalModelVersion,
     MetricRecord,
     TrainingRound,
@@ -183,6 +184,7 @@ class FederatedLearningServer:
         """Save Round-0 initial global checkpoint, compute its SHA-256 hash, and persist metadata."""
         self.round_0_hash = hash_state_dict(self.global_shared_state)
         r0_ckpt_path = self.exp_artifact_dir / "global_round_0.pt"
+        r0_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "experiment_id": self.experiment_id,
@@ -210,6 +212,30 @@ class FederatedLearningServer:
             },
         )
 
+        existing_cfg: dict[str, Any] = {}
+        with session_scope(self.database_url) as session:
+            existing_exp = session.execute(
+                select(Experiment).where(Experiment.experiment_id == self.experiment_id)
+            ).scalar_one_or_none()
+            if existing_exp is not None and isinstance(existing_exp.config_json, dict):
+                existing_cfg = dict(existing_exp.config_json)
+
+        merged_cfg = {
+            **existing_cfg,
+            "task_type": self.task_type,
+            "algorithm": self.algorithm,
+            "client_ids": list(self.client_ids),
+            "remote_client_ids": list(self.remote_client_ids),
+            "execution_mode": (
+                existing_cfg.get("execution_mode")
+                or ("distributed" if self.remote_client_ids else "single_laptop")
+            ),
+            "total_rounds": total_rounds,
+            "seed": self.seed,
+            "adapter_kwargs": self.adapter_kwargs,
+            "policy": self.policy.to_manifest_dict(),
+        }
+
         create_or_update_experiment(
             experiment_id=self.experiment_id,
             task_type=self.task_type,
@@ -218,16 +244,7 @@ class FederatedLearningServer:
             current_round=0,
             total_rounds=total_rounds,
             seed=self.seed,
-            config_json={
-                "task_type": self.task_type,
-                "algorithm": self.algorithm,
-                "client_ids": list(self.client_ids),
-                "remote_client_ids": list(self.remote_client_ids),
-                "total_rounds": total_rounds,
-                "seed": self.seed,
-                "adapter_kwargs": self.adapter_kwargs,
-                "policy": self.policy.to_manifest_dict(),
-            },
+            config_json=merged_cfg,
             log_line=f"Initialized Round 0 global model (hash={self.round_0_hash})",
             database_url=self.database_url,
         )
@@ -670,6 +687,12 @@ class FederatedLearningServer:
             for cid in self.client_ids:
                 if cid in self.remote_client_ids:
                     continue
+                if should_cancel is not None and should_cancel():
+                    round_mgr.transition_to(RoundState.CANCELLED)
+                    self._terminal_state = RoundState.CANCELLED.value
+                    raise RuntimeError(
+                        f"Round {round_num} cancelled before local client '{cid}' training."
+                    )
                 client = self.clients[cid]
                 upd = client.train_round(
                     experiment_id=self.experiment_id,
@@ -687,6 +710,7 @@ class FederatedLearningServer:
                     device=device,
                     seed=self.seed,
                     reusable_adapter=self._worker_adapter,
+                    should_cancel=should_cancel,
                 )
                 eff_dev = str(
                     device

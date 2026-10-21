@@ -276,6 +276,7 @@ class TrainingJobManager:
         num_rounds: int = 20,
         config: dict[str, Any] | None = None,
         training_id: str | None = None,
+        execution_mode: str | None = None,
         cfg: Settings | None = None,
         web3_connector: Web3Connector | None = None,
         database_url: str | None = None,
@@ -306,17 +307,66 @@ class TrainingJobManager:
         if task == "superresolution" and scale_factor not in (2, 4, 8):
             raise ValueError(f"Super-resolution scale_factor must be 2, 4, or 8; got {scale_factor}.")
 
+        # Explicit execution mode resolution
+        raw_mode = str(execution_mode or job_cfg.get("execution_mode", "single_laptop")).strip().lower()
+        if raw_mode not in ("single_laptop", "distributed", "distributed_two_laptop"):
+            raise ValueError(
+                f"Invalid execution_mode '{raw_mode}'. Expected 'single_laptop' or 'distributed_two_laptop'."
+            )
+        is_distributed = raw_mode in ("distributed", "distributed_two_laptop") or bool(
+            job_cfg.get("remote_client_ids")
+        )
+
+        if is_distributed:
+            if task != "classification":
+                raise ValueError(
+                    f"Two-laptop distributed execution is currently validated for 'classification' "
+                    f"(client_1 GPU DermaMNIST + client_2 CPU PathMNIST). Distributed execution for "
+                    f"'{task}' is not yet supported; please use Single-Laptop Mode for {task}."
+                )
+            client_ids = tuple(job_cfg.get("client_ids", ["client_1", "client_2"]))
+            raw_remote = job_cfg.get("remote_client_ids", ["client_2"]) or ["client_2"]
+            remote_client_ids = tuple(str(c).strip() for c in raw_remote if str(c).strip())
+            effective_mode = "distributed"
+        else:
+            client_ids = tuple(job_cfg.get("client_ids", ["client_1", "client_2", "client_3"]))
+            remote_client_ids = ()
+            effective_mode = "single_laptop"
+
         with self._lock:
-            # Check for any running job in memory or DB
+            # 1. Reconcile dead threads
+            for active_id, thread in list(self._active_threads.items()):
+                if not thread.is_alive():
+                    self._active_threads.pop(active_id, None)
+                    self._active_servers.pop(active_id, None)
+                    self._cancel_requested.discard(active_id)
+
+            # 2. Check remaining alive threads against DB state
             for active_id, thread in list(self._active_threads.items()):
                 if thread.is_alive():
+                    with session_scope(db_url) as session:
+                        exp_rec = session.execute(
+                            select(Experiment).where(Experiment.experiment_id == active_id)
+                        ).scalar_one_or_none()
+                        exp_status = exp_rec.status if exp_rec else None
+
+                    if exp_status in ("COMPLETED", "FAILED", "CANCELLED"):
+                        thread.join(timeout=1.0)
+                        if not thread.is_alive():
+                            self._active_threads.pop(active_id, None)
+                            self._active_servers.pop(active_id, None)
+                            self._cancel_requested.discard(active_id)
+                            continue
+
                     raise ConcurrentTrainingJobError(
                         f"Another training job ('{active_id}') is currently active on the single GPU."
                     )
+
+            # 3. Check for genuinely active experiment in database
             with session_scope(db_url) as session:
                 running_exp = (
                     session.execute(
-                        select(Experiment).where(Experiment.status.in_(["RUNNING"]))
+                        select(Experiment).where(Experiment.status.in_(["RUNNING", "TRAINING"]))
                     )
                     .scalars()
                     .first()
@@ -328,12 +378,9 @@ class TrainingJobManager:
 
             exp_id = training_id or f"exp_{task}_{algorithm}_{uuid.uuid4().hex[:8]}"
             seed = int(job_cfg.get("seed", active_cfg.random_seed))
-            client_ids = tuple(job_cfg.get("client_ids", ["client_1", "client_2", "client_3"]))
             if not client_ids:
                 raise ValueError("client_ids cannot be empty.")
 
-            raw_remote = job_cfg.get("remote_client_ids", []) or []
-            remote_client_ids = tuple(str(c).strip() for c in raw_remote if str(c).strip())
             if remote_client_ids:
                 unknown = [c for c in remote_client_ids if c not in client_ids]
                 if unknown:
@@ -380,7 +427,7 @@ class TrainingJobManager:
                 "num_rounds": int(num_rounds),
                 "client_ids": list(client_ids),
                 "remote_client_ids": list(remote_client_ids),
-                "execution_mode": "distributed" if remote_client_ids else "single_laptop",
+                "execution_mode": effective_mode,
                 "remote_round_timeout_sec": remote_timeout,
                 "local_epochs": int(job_cfg.get("local_epochs", active_cfg.default_local_epochs)),
                 "learning_rate": float(job_cfg.get("learning_rate", 1e-3)),
@@ -558,6 +605,8 @@ class TrainingJobManager:
         finally:
             with self._lock:
                 self._active_threads.pop(experiment_id, None)
+                self._active_servers.pop(experiment_id, None)
+                self._cancel_requested.discard(experiment_id)
 
     def cancel_training(
         self,
@@ -578,6 +627,14 @@ class TrainingJobManager:
             cur_round = exp.current_round
             tot_rounds = exp.total_rounds
 
+        # Reconcile memory tracking for already terminal jobs
+        with self._lock:
+            th = self._active_threads.get(training_id)
+            if th is not None and not th.is_alive():
+                self._active_threads.pop(training_id, None)
+                self._active_servers.pop(training_id, None)
+                self._cancel_requested.discard(training_id)
+
         if current_status in ("COMPLETED", "FAILED", "CANCELLED"):
             return {
                 "training_id": training_id,
@@ -588,6 +645,8 @@ class TrainingJobManager:
         with self._lock:
             self._cancel_requested.add(training_id)
             active_srv = self._active_servers.get(training_id)
+            worker_th = self._active_threads.get(training_id)
+
         if active_srv is not None:
             with active_srv._remote_cond:
                 active_srv._remote_cond.notify_all()
@@ -596,18 +655,53 @@ class TrainingJobManager:
             experiment_id=training_id,
             task_type=task_type,
             algorithm=algorithm,
-            status="CANCELLED",
+            status="CANCELLING",
             current_round=cur_round,
             total_rounds=tot_rounds,
             log_line=f"Cancellation requested for job {training_id} at round {cur_round}.",
             database_url=db_url,
         )
+
+        # Allow worker thread up to 3.0 seconds to safely halt at its step boundary
+        if worker_th is not None and worker_th.is_alive():
+            worker_th.join(timeout=3.0)
+
+        with self._lock:
+            th_alive = worker_th.is_alive() if worker_th else False
+            if not th_alive:
+                self._active_threads.pop(training_id, None)
+                self._active_servers.pop(training_id, None)
+                self._cancel_requested.discard(training_id)
+
+        with session_scope(db_url) as session:
+            final_exp = session.execute(
+                select(Experiment).where(Experiment.experiment_id == training_id)
+            ).scalar_one()
+            final_status = final_exp.status
+
+        if not th_alive and final_status != "CANCELLED":
+            create_or_update_experiment(
+                experiment_id=training_id,
+                task_type=task_type,
+                algorithm=algorithm,
+                status="CANCELLED",
+                current_round=cur_round,
+                total_rounds=tot_rounds,
+                log_line=f"Job {training_id} acknowledged safe cancellation and halted.",
+                database_url=db_url,
+            )
+            final_status = "CANCELLED"
+
         return {
             "training_id": training_id,
-            "status": "CANCELLED",
+            "status": final_status,
             "current_round": cur_round,
             "total_rounds": tot_rounds,
-            "message": "Cancellation requested at safe round/client boundary.",
+            "message": (
+                "Job cancelled successfully at safe step boundary."
+                if final_status == "CANCELLED"
+                else "Cancellation in progress; waiting for active step to halt safely."
+            ),
         }
 
     def resume_training(
@@ -880,15 +974,19 @@ class TrainingJobManager:
                     }
                 )
 
+            raw_mode = str(cfg_dict.get("execution_mode", "")).strip().lower()
+            if raw_mode in ("distributed", "distributed_two_laptop") or remote_cids:
+                effective_mode_status = "distributed"
+            else:
+                effective_mode_status = "single_laptop"
+
             return {
                 "training_id": exp.experiment_id,
                 "experiment_id": exp.experiment_id,
                 "task_type": exp.task_type,
                 "algorithm": exp.algorithm,
                 "status": exp.status,
-                "execution_mode": cfg_dict.get(
-                    "execution_mode", "distributed" if remote_cids else "single_laptop"
-                ),
+                "execution_mode": effective_mode_status,
                 "remote_client_ids": sorted(remote_cids),
                 "awaiting_remote_clients": awaiting_remote,
                 "current_round": exp.current_round,

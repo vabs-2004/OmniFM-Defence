@@ -13,7 +13,7 @@ Each logical client:
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +160,7 @@ class FederatedHospitalClient:
         device: torch.device | str | None = None,
         seed: int = 42,
         reusable_adapter: BaseTaskAdapter | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClientUpdatePayload:
         """Execute one federated round of local training and evaluation for this hospital client."""
         t0 = time.perf_counter()
@@ -219,6 +220,8 @@ class FederatedHospitalClient:
 
         for epoch_idx in range(epochs):
             for batch_x, batch_y in train_loader:
+                if should_cancel is not None and should_cancel():
+                    raise RuntimeError(f"Client {self.client_id} training cancelled at epoch {epoch_idx}.")
                 bsz = int(batch_x.shape[0])
                 if epoch_idx == 0:
                     total_samples += bsz
@@ -268,7 +271,9 @@ class FederatedHospitalClient:
                     )
 
         # Evaluate on validation split
-        eval_metrics = self._evaluate(adapter, val_loader, knowledge_bank, scale, dev, use_amp)
+        eval_metrics = self._evaluate(
+            adapter, val_loader, knowledge_bank, scale, dev, use_amp, should_cancel=should_cancel
+        )
 
         # Save personalized parameters locally and extract shared parameters
         self._save_personalized_state(adapter, active_policy, experiment_id, round_num)
@@ -323,6 +328,7 @@ class FederatedHospitalClient:
         scale: int,
         dev: torch.device,
         use_amp: bool,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         adapter.eval()
         all_preds: list[torch.Tensor] = []
@@ -330,6 +336,8 @@ class FederatedHospitalClient:
         num_classes: int | None = None
 
         for batch_x, batch_y in val_loader:
+            if should_cancel is not None and should_cancel():
+                raise RuntimeError(f"Client {self.client_id} evaluation cancelled.")
             batch_x = batch_x.to(dev)
             batch_y = batch_y.to(dev)
             with torch.amp.autocast(
